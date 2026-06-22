@@ -375,7 +375,7 @@ elif app_mode == "レポート履歴":
                                 f"・体幹前傾: {full_data['angle_vertical']} 度\n"
                                 f"・股関節角: {full_data['angle_hip']} 度\n"
                                 f"・大腿角度: {full_data['angle_femoral']} 度\n"
-                                f"・膝の角度: {full_data['knee']} 度\n\n"
+                                f"・膝の角度: {full_data['angle_knee']} 度\n\n"
                                 f"・座面高さ: {full_data['height_chair']} cm\n"
                                 f"・作業高さ: {full_data['height_work']} cm")
                         
@@ -391,4 +391,4 @@ elif app_mode == "レポート履歴":
                     st.success(f"**■ 理学療法士の助言・環境調整案**\n\n{full_data['comment_advice']}")
                     
         except Exception as e:
-            st.error(f"履歴の読み込み中にエラーが発生しました: {e}")
+            st.error(f"履歴の読み込み中にエラーが発生しました: {e}")    
