@@ -1,6 +1,5 @@
 streamlit
 mediapipe==0.10.14
-protobuf==3.20.3
 opencv-python-headless
-numpy
+numpy<2
 pandas
