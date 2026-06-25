@@ -495,7 +495,14 @@ elif app_mode == "レポート履歴":
                     
                     if st.button("🚨 このレポートを削除する", type="primary", disabled=not confirm_delete, key=f"del_btn_{target_report_id}"):
                         if delete_report_by_id(target_report_id):
-                            st.success(f"レポート {target_report_id} を削除しました。")
+                            # トースト通知（ポップアップ）で削除成功を知らせる
+                            st.toast(f"🎉 レポート {target_report_id} を削除しました。")
+                            
+                            # ボタンの二重実行やブラウザの混乱を防ぐため、セッションの状態をクリア
+                            if "captured_image" in st.session_state:
+                                st.session_state.captured_image = None
+                            
+                            # 【重要】少しだけ待つか、再読み込みのトリガーを安全に引く
                             st.rerun()
                         else:
                             st.error("削除処理に失敗しました。")
