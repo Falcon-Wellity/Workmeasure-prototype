@@ -2,15 +2,22 @@ import streamlit as st
 import cv2
 import mediapipe as mp
 import numpy as np
+import os
+import pandas as pd
+from PIL import Image, ImageOps  # スマホ画像の回転補正用
 
 # --- CSV蓄積モジュールをインポート ---
-from csv_db import save_report_to_csv
+from csv_db import save_report_to_csv, delete_report_by_id
 
 # ==========================================
 # 1. MediaPipe ＆ 画像処理ライブラリの初期設定
 # ==========================================
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
+
+# 視認性向上のためのカスタム描画スタイル定義（太さと半径を大きく変更）
+CUSTOM_LANDMARK_STYLE = mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=-1, circle_radius=5) # 赤い点
+CUSTOM_CONNECTIONS_STYLE = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=4, circle_radius=2) # 緑の線
 
 # ==========================================
 # 2. 姿勢分析のための幾何学計算関数
@@ -42,35 +49,46 @@ def calculate_vertical_angle(a, b):
 # 3. Streamlit UI 画面レイアウト定義
 # ==========================================
 st.set_page_config(page_title="WorkMeasure プロトタイプ", layout="wide")
-st.title("WorkMeasure (ワークメジャー) - 姿勢計測プロトタイプ")
+st.title("WorkMeasure - 作業姿勢評価Prototype")
 
-# サイドバーメニュー
+# サイドバーメニュー（項目を追加）
 st.sidebar.header("メニュー")
-app_mode = st.sidebar.selectbox("操作を選択", ["新規姿勢計測", "レポート履歴"])
+app_mode = st.sidebar.selectbox("操作を選択", ["新規姿勢計測", "食事姿勢計測", "正面姿勢計測", "レポート履歴"])
 
+# メモリ保持用セッションの初期化関数
+def reset_measurement_session():
+    st.session_state.captured_image = None      
+    st.session_state.captured_angles = {}       
+    st.session_state.show_report = False        
+
+if "captured_image" not in st.session_state:
+    st.session_state.captured_image = None      
+if "captured_angles" not in st.session_state:
+    st.session_state.captured_angles = {}       
+if "show_report" not in st.session_state:
+    st.session_state.show_report = False        
+
+# --- 各メニューに応じた画面描画 ---
 if app_mode == "新規姿勢計測":
     st.subheader("⚠️ 横向きから、全身（耳・肩・股関節・膝・足）が写るように撮影・保存してください")
+
+    # 明示的なクリアボタンを配置
+    if st.session_state.captured_image is not None or st.session_state.show_report:
+        if st.button("🔄 画面を初期化して、新しい計測を始める", type="secondary"):
+            reset_measurement_session()
+            st.rerun()
 
     col1, col2 = st.columns(2)
     with col1:
         work_env = st.selectbox("作業環境を選択", ["デスクワーク", "軽作業（立ち仕事）", "重作業"])
     with col2:
-        work_posture = st.selectbox("作業姿勢を選択", ["座位", "立位"])
+        work_posture = st.selectbox("作業姿勢を選択", ["座位", "立位", "低位置"])
 
     display_col, result_col = st.columns([2, 1])
-
-    # メモリ保持用セッションの初期化
-    if "captured_image" not in st.session_state:
-        st.session_state.captured_image = None      
-    if "captured_angles" not in st.session_state:
-        st.session_state.captured_angles = {}       
-    if "show_report" not in st.session_state:
-        st.session_state.show_report = False        
 
     # --- パターンA：まだ撮影/アップロードしていない（画像未確定状態） ---
     if st.session_state.captured_image is None:
         with display_col:
-            # 入力方法の選択（ラジオボタンで並行化）
             input_method = st.radio("撮影方法を選択してください：", ["リアルタイムカメラで撮影", "保存済みの写真をアップロード"])
             st.write("---")
             
@@ -96,7 +114,7 @@ if app_mode == "新規姿勢計測":
                 capture_button = st.button("🔍 アップロードした写真を解析・保存", use_container_width=True, type="primary")
 
         # ------------------------------------------
-        # A-1. リアルタイムカメラの処理ロジック（Web用安全ガード付き）
+        # A-1. リアルタイムカメラの処理ロジック
         # ------------------------------------------
         if input_method == "リアルタイムカメラで撮影" and run_camera:
             try:
@@ -119,7 +137,12 @@ if app_mode == "新規姿勢計測":
                         current_angles = {}
                         
                         if results.pose_landmarks:
-                            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                            # カスタムスタイルを適用（線と点を太く）
+                            mp_drawing.draw_landmarks(
+                                image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                landmark_drawing_spec=CUSTOM_LANDMARK_STYLE,
+                                connection_drawing_spec=CUSTOM_CONNECTIONS_STYLE
+                            )
                             try:
                                 landmarks = results.pose_landmarks.landmark
                                 right_shoulder_vis = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].visibility
@@ -144,7 +167,8 @@ if app_mode == "新規姿勢計測":
                                 angle_trunk_vertical = calculate_vertical_angle(shoulder, hip)
                                 angle_hip = 180.0 - calculate_angle(shoulder, hip, knee)
                                 angle_femoral = calculate_horizontal_angle(hip, knee)
-                                angle_knee = calculate_angle(hip, knee, ankle)
+                                # 【修正】膝の屈曲角計算を 180度からの引き算に変更
+                                angle_knee = 180.0 - calculate_angle(hip, knee, ankle)
                                 
                                 current_angles = {
                                     "back": int(angle_back), "vertical": int(angle_trunk_vertical),
@@ -155,7 +179,7 @@ if app_mode == "新規姿勢計測":
                                 back_placeholder.metric(label="首の傾き", value=f"{current_angles['back']} 度")
                                 trunk_vertical_placeholder.metric(label="体幹の前傾角度 (垂直線基準)", value=f"{current_angles['vertical']} 度")
                                 hip_placeholder.metric(label="股関節の角度", value=f"{current_angles['hip']} 度")
-                                femoral_placeholder.metric(label="大腿の角度 (水平線基準)", value=f"{current_angles['femoral']} 度")
+                                femoral_placeholder.metric(label="大腿の傾斜 (水平線基準)", value=f"{current_angles['femoral']} 度")
                                 knee_placeholder.metric(label="膝の角度", value=f"{current_angles['knee']} 度")
                             except:
                                 pass
@@ -169,22 +193,33 @@ if app_mode == "新規姿勢計測":
                             st.rerun()
                 camera.release()
             except Exception as e:
-                st.error("⚠️ 本環境（Webサーバー等）ではリアルタイムカメラを起動できません。左側のメニューから『保存済みの写真をアップロード』を選択して解析を行ってください。")
+                st.error("⚠️ 本環境ではリアルタイムカメラを起動できません。左側の選択肢から『保存済みの写真をアップロード』を選択して解析を行ってください。")
 
         # ------------------------------------------
         # A-2. 写真アップロードの処理ロジック
         # ------------------------------------------
         if input_method == "保存済みの写真をアップロード" and uploaded_file is not None:
-            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            raw_image = cv2.imdecode(file_bytes, 1)
-            image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB)
+            # スマホ撮影写真の回転（EXIF）をPILで正常位置に補正してからOpenCV形式に変換
+            pil_image = Image.open(uploaded_file)
+            pil_image = ImageOps.exif_transpose(pil_image)
+            raw_image = np.array(pil_image)
+            
+            # RGBフォーマットに統一
+            if raw_image.shape[2] == 4:  # RGBA対策
+                raw_image = cv2.cvtColor(raw_image, cv2.COLOR_RGBA2RGB)
+            image = raw_image.copy()
             
             with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
                 results = pose.process(image)
                 current_angles = {}
                 
                 if results.pose_landmarks:
-                    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                    # カスタムスタイルを適用（線と点を太く）
+                    mp_drawing.draw_landmarks(
+                        image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                        landmark_drawing_spec=CUSTOM_LANDMARK_STYLE,
+                        connection_drawing_spec=CUSTOM_CONNECTIONS_STYLE
+                    )
                     try:
                         landmarks = results.pose_landmarks.landmark
                         right_shoulder_vis = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].visibility
@@ -209,7 +244,8 @@ if app_mode == "新規姿勢計測":
                         angle_trunk_vertical = calculate_vertical_angle(shoulder, hip)
                         angle_hip = 180.0 - calculate_angle(shoulder, hip, knee)
                         angle_femoral = calculate_horizontal_angle(hip, knee)
-                        angle_knee = calculate_angle(hip, knee, ankle)
+                        # 【修正】膝の屈曲角計算を 180度からの引き算に変更
+                        angle_knee = 180.0 - calculate_angle(hip, knee, ankle)
                         
                         current_angles = {
                             "back": int(angle_back), "vertical": int(angle_trunk_vertical),
@@ -220,13 +256,13 @@ if app_mode == "新規姿勢計測":
                         back_placeholder.metric(label="首の傾き", value=f"{current_angles['back']} 度")
                         trunk_vertical_placeholder.metric(label="体幹の前傾角度 (垂直線基準)", value=f"{current_angles['vertical']} 度")
                         hip_placeholder.metric(label="股関節の角度", value=f"{current_angles['hip']} 度")
-                        femoral_placeholder.metric(label="大腿の角度 (水平線基準)", value=f"{current_angles['femoral']} 度")
+                        femoral_placeholder.metric(label="大腿の傾斜 (水平線基準)", value=f"{current_angles['femoral']} 度")
                         knee_placeholder.metric(label="膝の角度", value=f"{current_angles['knee']} 度")
                     except:
                         pass
             
             with display_col:
-                st.image(image, caption="解析プレビュー（棒人間が重なっているか確認してください）")
+                st.image(image, caption="解析プレビュー（線と点がハッキリ重なっているか確認してください）")
                 
             if capture_button and current_angles:
                 st.session_state.captured_image = image
@@ -245,7 +281,7 @@ if app_mode == "新規姿勢計測":
             st.write(f"・首の傾き: **{angles['back']} 度**")
             st.write(f"・体幹の前傾: **{angles['vertical']} 度**")
             st.write(f"・股関節角度: **{angles['hip']} 度**")
-            st.write(f"・大腿の角度: **{angles['femoral']} 度**")
+            st.write(f"・大腿の傾斜: **{angles['femoral']} 度**")
             st.write(f"・膝の角度: **{angles['knee']} 度**")
             
             st.write("---")
@@ -254,7 +290,7 @@ if app_mode == "新規姿勢計測":
             height_work = st.number_input("作業高さ (cm) ※実測", min_value=0, max_value=200, value=75)
             
             st.write("---")
-            st.write("### 🩺 理学療法士の目による問題箇所の選択")
+            st.write("### 🩺 リハ専門職の目による問題箇所の選択")
             selected_issues = []
             if st.checkbox("首の傾き（または猫背）"): selected_issues.append("首の傾き")
             if st.checkbox("体幹の過度な前傾/後傾"): selected_issues.append("体幹前傾角度")
@@ -266,9 +302,7 @@ if app_mode == "新規姿勢計測":
             
             st.write("---")
             if st.button("🔄 撮り直す / 写真を選び直す", type="secondary", use_container_width=True):
-                st.session_state.captured_image = None
-                st.session_state.captured_angles = {}
-                st.session_state.show_report = False
+                reset_measurement_session()
                 st.rerun()
                 
             if st.button("📄 この姿勢でBasicReportを作成する", type="primary", use_container_width=True):
@@ -301,13 +335,62 @@ if app_mode == "新規姿勢計測":
             
             st.write("### ✍️ 専門職コメント入力")
             
-            default_eva = "やや首が前方に傾いた姿勢です。" if "首の傾き" in selected_issues else "全体的なアライメントは概ね良好です。"
-            if "座面高さ" in selected_issues:
-                default_eva += f"椅子の高さが{angles['height_chair']}cmと実測され、作業環境とのミスマッチによる負担が懸念されます。"
-                
-            comment_eva = st.text_area("■ 理学療法士の評価", value=default_eva, height=200)
-            comment_advice = st.text_area("■ 理学療法士の助言", value="【環境調整案】\n・作業高さを調整し、頸部屈角（首の傾き）が強くならない視線を確保しましょう。\n\n【身体へのアプローチ】\n・", height=200)
+# --- ✍️ 専門職コメントの自動生成ロジック ---
             
+            # 各チェックボックスに対応するテンプレート辞書（評価・助言）
+            # ※文言は現場に合わせていつでも自由に変更・調整してください。
+            templates = {
+                "首の傾き": {
+                    "eva": "・頭部・頸部が前方に突出しており、首や肩の筋肉や骨への持続的なストレスが懸念されます。",
+                    "adv": "・モニターや手元の対象物の高さを上げ視線を高く保ち、首への負担や肩こりを予防しましょう。"
+                },
+                "体幹前傾角度": {
+                    "eva": f"・体幹が過度に前傾しており、腰背部の筋肉や椎間板に大きな負担がかかっています。（計測値: {angles['vertical']}度）腰痛のリスクが高まっています。",
+                    "adv": "・椅子の奥まで深く腰掛け、骨盤を立てて背もたれを活用できる作業距離に調整してください。"
+                },
+                "股関節の不適切姿勢": {
+                    "eva": "・骨盤が後傾し、いわゆる『仙骨座り』の傾向が見られます。坐骨で体重を支持できておらず、腰痛のリスクが高まっています。",
+                    "adv": "・クッションなどを活用して骨盤の後傾を防ぎ、坐骨結節でしっかりと座面を捉えられるよう座り方を指導してください。"
+                },
+                "大腿の傾斜": {
+                    "eva": "・座面に対して大腿部が平行に保たれておらず、骨盤や股関節のアライメント不良、または座面の適合不全が疑われます。",
+                    "adv": "・足の裏全体がしっかりと床（またはフットレスト）に接地するよう、足元の環境を見直してください。"
+                },
+                "膝関節の角度": {
+                    "eva": f"・膝関節の屈曲角度が不適切（計測値: {angles['knee']}度）であり、下肢の血流阻害や、立ち上がり時の負担増につながる恐れがあります。",
+                    "adv": "・足首や膝が概ね90度前後の楽な角度に保てるよう、椅子の奥行きや足元のスペースを確保してください。"
+                },
+                "座面高さ": {
+                    "eva": f"・椅子の座面高さ（計測値: {angles['height_chair']}cm）を作業者の体格、または手元の作業台とうまく適合できていません。",
+                    "adv": "・座面の高さを調整し、足裏が接地した状態で肘が90度屈曲して作業台に添えられる位置を基準にしてください。"
+                },
+                "作業高さ": {
+                    "eva": f"：作業台・手元の高さ（計測値: {angles['height_work']}cm）が不適合です。手元が低すぎる、または高すぎることが原因で肩・腰・膝への負担が懸念されます。",
+                    "adv": "・可能であれば昇降デスク等の活用、または肘の高さに合わせた手元台の設置などで、適切な作業高さを確保してください。"
+                }
+            }
+
+            # 選択された項目に基づいてテキストを組み立てる
+            if not selected_issues:
+                # 【ご要望】チェックが1項目も無い場合
+                default_eva = "姿勢や作業環境は身体への影響が少なく概ね良好です。"
+                default_advice = "【環境調整案】\n・現在の良好な作業環境と姿勢を維持してください。\n\n【身体へのアプローチ】\n・定期的な休憩やストレッチを行い、同一姿勢の持続を防ぎましょう。\n・以下の運動を１日１回実施しましょう。"
+            else:
+                # チェックがある場合、項目ごとに文章を改行して結合
+                eva_list = []
+                adv_list = []
+                for issue in selected_issues:
+                    if issue in templates:
+                        eva_list.append(templates[issue]["eva"])
+                        adv_list.append(templates[issue]["adv"])
+                
+                default_eva = "【解析結果に基づく専門的評価】\n" + "\n".join(eva_list)
+                default_advice = "【環境調整案・指導内容】\n" + "\n".join(adv_list) + "\n\n【身体へのアプローチ】\n・"
+
+            # 組み立てたテンプレートをテキストエリアの初期値(value)としてセット
+            comment_eva = st.text_area("■ 理学療法士の評価", value=default_eva, height=220)
+            comment_advice = st.text_area("■ 理学療法士の助言", value=default_advice, height=220)
+
             if st.button("💾 レポート内容を確定（プロトタイプ版保存）", type="primary"):
                 try:
                     saved_id = save_report_to_csv(
@@ -319,6 +402,8 @@ if app_mode == "新規姿勢計測":
                         advice=comment_advice,
                         image_bgr=st.session_state.captured_image
                     )
+                    # 【修正】保存成功時にセッションデータを即座に初期化し、次回計測が真っ新に行えるようにする
+                    reset_measurement_session()
                     st.session_state["save_success_msg"] = f"🎉 レポートが確定し、CSVデータベースに蓄積されました！ (ID: {saved_id})"
                     st.rerun()
                 except Exception as e:
@@ -327,22 +412,32 @@ if app_mode == "新規姿勢計測":
         if "save_success_msg" in st.session_state:
             st.success(st.session_state["save_success_msg"])
             del st.session_state["save_success_msg"]
+
+# --- 将来用追加メニューのプレースホルダー ---
+elif app_mode == "食事姿勢計測":
+    st.subheader("🍽️ 食事姿勢計測・評価（言語聴覚士向け機能）")
+    st.info("💡 【将来拡張予定】\n言語聴覚士（ST）による嚥下機能評価や、食事場面における頸部・体幹アライメントの分析・スクリーニングを行える専用モードを実装予定です。")
+
+elif app_mode == "正面姿勢計測":
+    st.subheader("🧍 正面姿勢計測・アライメント分析（理学療法士向け機能）")
+    st.info("💡 【将来拡張予定】\n理学療法士（PT）による正面（前額面）からの姿勢分析機能です。肩の高さの左右差、骨盤の傾き、体幹の側方傾斜などの評価を可能にする予定です。")
                     
 elif app_mode == "レポート履歴":
     st.subheader("📁 過去の作業環境評価レポート履歴")
     
-    import os
-    import pandas as pd
-    
     CSV_FILE_PATH = "posture_report_database.csv"
     
     if not os.path.isfile(CSV_FILE_PATH):
-        st.info("まだ保存されたレポート履歴がありません。新規計測を行ってデータを確定させてください。")
+        st.info("まだ保存されたレポート履歴がありません。新規計測を行ってデータを登録してください。")
     else:
         try:
             df = pd.read_csv(CSV_FILE_PATH, encoding="utf-8-sig")
+            
+            # 【安全ガード】IDや日時が空っぽ(NaN)の壊れた古い行を自動的に除外する
+            df = df.dropna(subset=["report_id", "created_at"])
+            
             if df.empty:
-                st.info("データが空です。")
+                st.info("有効なレポート履歴がありません。新規計測を行ってデータを登録してください。")
             else:
                 df_sorted = df.iloc[::-1].reset_index(drop=True)
                 st.write("### 🕒 レポート一覧（選択すると詳細が表示されます）")
@@ -357,7 +452,8 @@ elif app_mode == "レポート履歴":
                 
                 if selected_row is not None:
                     full_data = df_sorted.iloc[selected_row]
-                    st.write(f"## 📝 レポート詳細 : {full_data['report_id']}")
+                    target_report_id = full_data['report_id']
+                    st.write(f"## 📝 レポート詳細 : {target_report_id}")
                     st.caption(f"計測日時: {full_data['created_at']}")
                     
                     hist_col1, hist_col2 = st.columns([1, 1])
@@ -374,7 +470,7 @@ elif app_mode == "レポート履歴":
                         st.text(f"・首の傾き: {full_data['angle_back']} 度\n"
                                 f"・体幹前傾: {full_data['angle_vertical']} 度\n"
                                 f"・股関節角: {full_data['angle_hip']} 度\n"
-                                f"・大腿角度: {full_data['angle_femoral']} 度\n"
+                                f"・大腿傾斜: {full_data['angle_femoral']} 度\n"
                                 f"・膝の角度: {full_data['angle_knee']} 度\n\n"
                                 f"・座面高さ: {full_data['height_chair']} cm\n"
                                 f"・作業高さ: {full_data['height_work']} cm")
@@ -387,8 +483,22 @@ elif app_mode == "レポート履歴":
                     
                     st.write("---")
                     st.write("### 🩺 専門職による評価・指導内容")
-                    st.info(f"**■ 理学療法士の評価**\n\n{full_data['comment_evaluation']}")
-                    st.success(f"**■ 理学療法士の助言・環境調整案**\n\n{full_data['comment_advice']}")
+                    st.info(f"**■ リハ専門職の評価**\n\n{full_data['comment_evaluation']}")
+                    st.success(f"**■ リハ専門職の助言・環境調整案**\n\n{full_data['comment_advice']}")
+                    
+                    # ------------------------------------------
+                    # 【追加】不要な履歴の消去機能
+                    # ------------------------------------------
+                    st.write("---")
+                    st.write("### 🗑️ レポートの管理")
+                    confirm_delete = st.checkbox("このレポートを削除することを確認します。", key=f"del_chk_{target_report_id}")
+                    
+                    if st.button("🚨 このレポートを削除する", type="primary", disabled=not confirm_delete, key=f"del_btn_{target_report_id}"):
+                        if delete_report_by_id(target_report_id):
+                            st.success(f"レポート {target_report_id} を削除しました。")
+                            st.rerun()
+                        else:
+                            st.error("削除処理に失敗しました。")
                     
         except Exception as e:
-            st.error(f"履歴の読み込み中にエラーが発生しました: {e}")    
+            st.error(f"履歴の読み込み中にエラーが発生しました: {e}")
